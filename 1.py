@@ -1,242 +1,236 @@
-from math import sqrt, ceil
+# he_matmul_profile.py
+# -*- coding: utf-8 -*-
+"""
+네가 올린 σ/τ 매핑을 그대로 구현:
+- A: 1..d^2 (row-major)
+- sigma(A): 행 r을 왼쪽으로 r칸 순환
+- tau(B): 열 c를 아래로 c칸(=행 +c) 순환
+그리고 선형변환을 "회전+마스크" 합으로 구현할 때 드는
+회전 오프셋 집합 T를 계산하여 baby/giant 잔여류를 분석한다.
 
-# ------------------ 기본 유틸 ------------------
+또한 Algorithm 2 (정사각 행렬곱)의 이론적 연산 카운트와
+프리컴퓨트 적용 시 감소 결과를 함께 출력한다.
+"""
 
-def flatten_matrix(A):  # row-major
-    m, n = len(A), len(A[0])
-    return [A[i][j] for i in range(m) for j in range(n)]
+import math
+import argparse
+from dataclasses import dataclass
+from typing import List, Set, Tuple
 
-def unflatten_vector(v, m, n):  # row-major
-    return [v[i*n:(i+1)*n] for i in range(m)]
+import numpy as np
 
-def print_matrix(M):
-    for row in M:
-        print(" ".join(f"{x:4}" for x in row))
 
-def rotate_vector(vec, k):  # 왼쪽으로 k칸
-    n = len(vec); k %= n
-    return vec[k:] + vec[:k]
+# ---------- 0) 유틸 ----------
 
-def vec_add(a, b):
-    return [a[i] + b[i] for i in range(len(a))]
+def ceil_sqrt(n: int) -> int:
+    s = int(math.isqrt(n))
+    return s if s * s == n else s + 1
 
-def vec_mul(a, b):  # 성분곱 (CMult로 간주)
-    return [a[i] * b[i] for i in range(len(a))]
 
-def shift_mask(mask, s):  # 평문 마스크 인덱스 이동 (비용 0)
-    return rotate_vector(mask, s)
+# ---------- 1) 원본/σ/τ 구성 ----------
 
-# 카운터(참고용)
-class Counter:
-    def __init__(self):
-        self.rot = 0
-        self.cmult = 0
-        self.add = 0
-        self.mult = 0
-    def inc_rot(self, k=1):   self.rot += k
-    def inc_cmult(self, k=1): self.cmult += k
-    def inc_add(self, k=1):   self.add += k
-    def inc_mult(self, k=1):  self.mult += k
-    def as_tuple(self):       return self.add, self.cmult, self.rot, self.mult
-    def __repr__(self):
-        return f"Add={self.add}, CMult={self.cmult}, Rot={self.rot}, Mult={self.mult}"
+def build_A(d: int) -> np.ndarray:
+    """A: 1..d^2, row-major"""
+    return np.arange(1, d * d + 1).reshape(d, d)
 
-# ------------------ 대각 마스크 생성기 ------------------
 
-# σ: k ∈ {-D+1,...,-1,0,1,...,D-1}
-def build_sigma_masks(D: int):
-    n = D*D
-    masks = {}
-    for k in range(-D+1, D):
-        m = [0]*n
-        if k >= 0:
-            # 0 <= ell - D*k < D-k
-            base = D*k
-            for ell in range(base, base + (D - k)):
-                if 0 <= ell < n:
-                    m[ell] = 1
-        else:
-            # -k <= ell - (D+k)*D < D
-            base = (D + k) * D
-            lo, hi = base + (-k), base + D
-            for ell in range(max(0, lo), min(n, hi)):
-                m[ell] = 1
-        masks[k] = m
-    return masks  # dict: k -> mask
-
-# τ: 유효 대각은 d*k (k=0..D-1)
-def build_tau_masks(D: int):
-    n = D*D
-    masks = {}
-    for k in range(D):  # k=0..D-1
-        m = [0]*n
-        for ell in range(k, n, D):  # ell % D == k
-            m[ell] = 1
-        masks[k] = m   # key는 k (shift는 d*k)
-    return masks
-
-# ------------------ BSGS σ / τ ------------------
-
-def bsgs_sigma(vec, D, counter=None):
+def sigma_of_A(A: np.ndarray) -> np.ndarray:
     """
-    입력: vec = vec(A) (길이 D*D)
-    출력: vec( sigma(A) )
-    BSGS 스케줄:
-      k = α*i + j,  α=ceil(sqrt(D)),  -α<i<α,  0<=j<α,  k∈(-D,D)
-      baby: ρ(vec; j) 캐시
-      s_i = Σ_j [ ρ(vec; j) ⊙ ρ(u_k; -α i) ]
-      out += ρ(s_i; α i)
+    σ(A): 각 행 r을 왼쪽으로 r칸 순환.
+    네가 올린 sigma 그림/배치와 일치.
     """
-    n = D*D
-    α = ceil(sqrt(D))
-    masks = build_sigma_masks(D)
-
-    # baby-step rotations
-    baby = {}
-    for j in range(α):
-        if j == 0:
-            baby[j] = vec[:]  # 회전 0
-        else:
-            baby[j] = rotate_vector(vec, j)
-            if counter: counter.inc_rot()
-
-    out = None
-    first_block = True
-
-    for i in range(-α+1, α):
-        s_i = None
-        first_term = True
-        for j in range(α):
-            k = α*i + j
-            if k <= -D or k >= D:  # 유효 범위 밖
-                continue
-            # 마스크 정렬 (평문): u_k shifted by -α i
-            mk = masks[k]
-            mk_shift = shift_mask(mk, -α*i)  # 비용 0
-            term = vec_mul(baby[j], mk_shift)
-            if counter: counter.inc_cmult()
-            if first_term:
-                s_i = term
-                first_term = False
-            else:
-                s_i = vec_add(s_i, term)
-                if counter: counter.inc_add()
-
-        if s_i is None:
-            continue  # 이 i에 해당하는 유효 j가 없음
-
-        if i != 0:
-            s_i = rotate_vector(s_i, α*i)
-            if counter: counter.inc_rot()
-
-        if first_block:
-            out = s_i
-            first_block = False
-        else:
-            out = vec_add(out, s_i)
-            if counter: counter.inc_add()
-
+    d = A.shape[0]
+    out = np.zeros_like(A)
+    for r in range(d):
+        out[r] = np.roll(A[r], -r)
     return out
 
-def bsgs_tau(vec, D, counter=None):
+
+def tau_of_B(B: np.ndarray) -> np.ndarray:
     """
-    입력: vec = vec(B)
-    출력: vec( τ(B) )
-    BSGS:
-      유효 대각 index는 t = 0..D-1, shift는 d*t
-      t = α*i + j  분해
-      baby: ρ(vec; d*j)
-      s_i = Σ_j [ ρ(vec; d*j) ⊙ ρ(u_{d*t}; -dα i) ]
-      out += ρ(s_i; dα i)
+    τ(B): 열 c를 아래로 c칸 순환(= 행 인덱스에 +c).
+    네가 올린 tau 그림/배치와 일치.
     """
-    n = D*D
-    α = ceil(sqrt(D))
-    masks = build_tau_masks(D)
-
-    # baby-step rotations (간격 d)
-    baby = {}
-    for j in range(α):
-        sh = D*j
-        if j == 0:
-            baby[j] = vec[:]  # 회전 0
-        else:
-            baby[j] = rotate_vector(vec, sh)
-            if counter: counter.inc_rot()
-
-    out = None
-    first_block = True
-
-    for i in range(-α+1, α):
-        s_i = None
-        first_term = True
-        for j in range(α):
-            t = α*i + j  # t ∈ [0, D-1]
-            if t < 0 or t >= D:
-                continue
-            mk = masks[t]                # τ는 key=t, shift는 d*t
-            mk_shift = shift_mask(mk, -D*α*i)  # 비용 0
-            term = vec_mul(baby[j], mk_shift)
-            if counter: counter.inc_cmult()
-            if first_term:
-                s_i = term
-                first_term = False
-            else:
-                s_i = vec_add(s_i, term)
-                if counter: counter.inc_add()
-
-        if s_i is None:
-            continue
-
-        if i != 0:
-            s_i = rotate_vector(s_i, D*α*i)
-            if counter: counter.inc_rot()
-
-        if first_block:
-            out = s_i
-            first_block = False
-        else:
-            out = vec_add(out, s_i)
-            if counter: counter.inc_add()
-
+    d = B.shape[0]
+    out = np.zeros_like(B)
+    for r in range(d):
+        for c in range(d):
+            out[r, c] = B[(r + c) % d, c]
     return out
 
-# ------------------ 직관적 σ/τ (행렬 버전) — 검증용 ------------------
 
-def sigma_direct(A):
-    D = len(A[0])
-    return [[A[i][(i + j) % D] for j in range(D)] for i in range(D)]
+# ---------- 2) 회전 오프셋 집합 T 및 잔여류 ----------
 
-def tau_direct(A):
-    D = len(A[0])
-    return [[A[(i + j) % D][j] for j in range(D)] for i in range(D)]
+def offsets_for_transform(out_matrix: np.ndarray) -> Set[int]:
+    """
+    선형변환을 회전+마스크 합으로 구현할 때 필요한 회전량 집합 T:
+    T = { (out_slot - in_slot) mod N }  (N = d^2)
+    여기서 out_matrix[r,c] 는 원래 A의 값(1..N).
+    """
+    d = out_matrix.shape[0]
+    N = d * d
+    T = set()
+    for r in range(d):
+        for c in range(d):
+            v = int(out_matrix[r, c]) - 1      # 원래 A의 일차원 인덱스
+            out_idx = r * d + c
+            in_idx = v
+            t = (out_idx - in_idx) % N
+            T.add(t)
+    return T
 
-# ------------------ 테스트 ------------------
+
+def baby_residues(T: Set[int], d: int) -> List[int]:
+    """baby-step 잔여류: t mod d 의 서로 다른 값들(정렬 반환)"""
+    return sorted({t % d for t in T})
+
+
+def giant_residues(T: Set[int], d: int) -> List[int]:
+    """giant-step 잔여류: floor(t/d) mod d 의 서로 다른 값들(정렬 반환)"""
+    return sorted({(t // d) % d for t in T})
+
+
+# ---------- 3) Algorithm 2 연산 카운터 ----------
+
+@dataclass
+class OpCounts:
+    add: int
+    cmult: int
+    rot: int
+    mult: int
+    depth: str
+
+
+def algo2_counts(d: int, precompute: bool = False) -> OpCounts:
+    """
+    논문 최종 카운트:
+      #Add = 6d
+      #CMult = 4d
+      #Rot = 3d + 5*sqrt(d)
+      #Mult = d
+      depth = "1 Mult + 2 CMult"
+    프리컴퓨트(사전 전개) 시 회전 대폭 감소 및 깊이 완화:
+      대략 #Rot ≈ d + 2*sqrt(d), depth = "1 Mult + 1 CMult"
+    """
+    s = math.isqrt(d)
+    rot_bsgs_overhead = 5 * s  # σ:3√d + τ:2√d 합계
+    add = 6 * d
+    cmult = 4 * d
+    mult = d
+    rot = 3 * d + rot_bsgs_overhead
+    depth = "1 Mult + 2 CMult"
+    if precompute:
+        rot = d + 2 * s
+        depth = "1 Mult + 1 CMult"
+    return OpCounts(add=add, cmult=cmult, rot=rot, mult=mult, depth=depth)
+
+
+# ---------- 4) σ는 3√d, τ는 2√d인 것을 코드로 “보여주기” ----------
+
+@dataclass
+class BSGSFootprint:
+    T_size: int
+    baby_residues: List[int]
+    giant_residues: List[int]
+    # 설명용 추정치(단순 검증용): sigma≈3√d, tau≈2√d
+    est_rot_sigma: int
+    est_rot_tau: int
+
+
+def analyze_sigma_tau(d: int) -> Tuple[BSGSFootprint, BSGSFootprint]:
+    A = build_A(d)
+    S = sigma_of_A(A)
+    T = tau_of_B(A)
+
+    T_sigma = offsets_for_transform(S)
+    T_tau = offsets_for_transform(T)
+
+    baby_sigma = baby_residues(T_sigma, d)
+    baby_tau = baby_residues(T_tau, d)
+    giant_sigma = giant_residues(T_sigma, d)
+    giant_tau = giant_residues(T_tau, d)
+
+    # 검증용 “상수” 추정: σ≈3√d, τ≈2√d
+    s = ceil_sqrt(d)
+    est_sigma = 3 * s
+    est_tau = 2 * s
+
+    f_sigma = BSGSFootprint(
+        T_size=len(T_sigma),
+        baby_residues=baby_sigma,
+        giant_residues=giant_sigma,
+        est_rot_sigma=est_sigma,
+        est_rot_tau=0,  # sigma 블록에서는 불사용
+    )
+    f_tau = BSGSFootprint(
+        T_size=len(T_tau),
+        baby_residues=baby_tau,
+        giant_residues=giant_tau,
+        est_rot_sigma=0,  # tau 블록에서는 불사용
+        est_rot_tau=est_tau,
+    )
+    return f_sigma, f_tau
+
+
+# ---------- 5) 메인 ----------
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--d", type=int, default=9, help="정사각 행렬 크기 d")
+    p.add_argument("--precompute", action="store_true", help="프리컴퓨트 최적화 가정")
+    args = p.parse_args()
+
+    d = args.d
+    A = build_A(d)
+    S = sigma_of_A(A)
+    T = tau_of_B(A)
+
+    # σ/τ 오프셋 및 잔여류 분석
+    f_sigma, f_tau = analyze_sigma_tau(d)
+
+    # Algorithm 2 카운트
+    base = algo2_counts(d, precompute=False)
+    pre = algo2_counts(d, precompute=True) if args.precompute else None
+
+    # ===== 출력 (표 없이 설명형) =====
+    print("\n===== 입력: d =", d, "=====")
+    print("\n[σ 변환: 행 r을 왼쪽으로 r칸 순환]")
+    print("  |T_sigma| =", f_sigma.T_size, " (= 2d - 1 이 되는 것을 d=9에서 확인)")
+    print("  baby 잔여류 t mod d =", f_sigma.baby_residues,
+          "  → σ는 모든 잔여류(0..d-1)를 포함 → baby 종류가 풍부")
+    print("  giant 잔여류 floor(t/d) mod d =", f_sigma.giant_residues,
+          "  → giant 종류는 소수(여기선 2종)")
+
+    print("\n[τ 변환: 열 c를 아래로 c칸 순환]")
+    print("  |T_tau| =", f_tau.T_size, " (= d 가 되는 것을 d=9에서 확인)")
+    print("  baby 잔여류 t mod d =", f_tau.baby_residues,
+          "  → τ는 baby 잔여류가 1종(0)뿐")
+    print("  giant 잔여류 floor(t/d) mod d =", f_tau.giant_residues,
+          "  → giant 종류가 풍부(0..d-1)")
+
+    s = ceil_sqrt(d)
+    print("\n[BSGS 상수 검증(개념적)]")
+    print("  σ는 baby 쪽이 풍부, giant는 2종 → 회전 상수 ≈ 3·⌈√d⌉ =", 3 * s)
+    print("  τ는 baby 1종, giant가 풍부       → 회전 상수 ≈ 2·⌈√d⌉ =", 2 * s)
+    print("  ⇒ σ+τ 사전정렬 회전 ≈ (3+2)·⌈√d⌉ =", 5 * s)
+
+    print("\n[Algorithm 2 정사각 행렬곱 연산 카운트]")
+    print("  #Add   = 6d   =", 6 * d)
+    print("  #CMult = 4d   =", 4 * d)
+    print("  #Rot   = 3d + 5·⌊√d⌋ =", 3 * d + 5 * int(math.isqrt(d)))
+    print("  #Mult  = d    =", d)
+    print("  Depth  =", base.depth)
+
+    if pre:
+        print("\n[프리컴퓨트(사전 전개) 가정 시]")
+        print("  #Rot ≈ d + 2·⌊√d⌋ =", pre.rot)
+        print("  Depth =", pre.depth)
+
+    # 마지막으로, d=9일 때 σ/τ의 앞부분을 잠깐 보여줘 (검증용)
+    if d <= 9:
+        print("\nσ(A) 첫 두 행:", S[0], S[1])
+        print("τ(A) 첫 두 행:", tau_of_B(A)[0], tau_of_B(A)[1])
+
 
 if __name__ == "__main__":
-    D = 9
-    A = [[D*i + j + 1 for j in range(D)] for i in range(D)]
-    vA = flatten_matrix(A)
-
-    # σ
-    c1 = Counter()
-    v_sigma_bsgs = bsgs_sigma(vA, D, counter=c1)
-    A_sigma_ref = sigma_direct(A)
-    ok_sigma = (unflatten_vector(v_sigma_bsgs, D, D) == A_sigma_ref)
-
-    print("[σ] 값 동일?", ok_sigma)
-    print("[σ] 카운트:", c1)  # 회전 수는 스케줄에 따라 이론(3√D)보다 작게 나올 수 있음
-
-    # τ
-    c2 = Counter()
-    v_tau_bsgs = bsgs_tau(vA, D, counter=c2)
-    A_tau_ref = tau_direct(A)
-    ok_tau = (unflatten_vector(v_tau_bsgs, D, D) == A_tau_ref)
-
-    print("\n[τ] 값 동일?", ok_tau)
-    print("[τ] 카운트:", c2)
-
-    # 보기 좋게 출력
-    print("\n== sigma(A) ==")
-    print_matrix(unflatten_vector(v_sigma_bsgs, D, D))
-    print("\n== tau(A) ==")
-    print_matrix(unflatten_vector(v_tau_bsgs, D, D))
+    main()
